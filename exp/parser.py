@@ -21,10 +21,16 @@ def get_parser():
     parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--weight_decay', type=float, default=0.0005)
     parser.add_argument('--sheaf_decay', type=float, default=None)
+    parser.add_argument('--rest_maps_type', type=str, choices=['diag', 'orth', 'general'], default='general')
+    parser.add_argument('--rest_maps_mlp_layers', type=int, default=2)
+    parser.add_argument('--rest_maps_mlp_hc', type=int, default=32)
+    parser.add_argument('--final_mlp_layers', type=int, default=2)
+    parser.add_argument('--final_mlp_hc', type=int, default=32)
     parser.add_argument('--early_stopping', type=int, default=200)
     parser.add_argument('--min_acc', type=float, default=0.0,
                         help="Minimum test acc on the first fold to continue training.")
     parser.add_argument('--stop_strategy', type=str, choices=['loss', 'acc'], default='loss')
+    parser.add_argument('--lr_decay_patience', type=int, default=50)
 
     # Model configuration
     parser.add_argument('--d', type=int, default=2)
@@ -60,7 +66,8 @@ def get_parser():
     parser.add_argument('--seed', type=int, default=43)
     parser.add_argument('--cuda', type=int, default=0)
     parser.add_argument('--folds', type=int, default=10)
-    parser.add_argument('--model', type=str, choices=['DiagSheaf', 'BundleSheaf', 'GeneralSheaf', 'DiagSheafODE',
+    parser.add_argument('--model', type=str, choices=['GaussianMLP', 'GaussianGCN', 'GaussianSheafDiffusion', 'SampledGaussianSheafDiffusion',
+                                                      'DiscreteDiagSheafDiffusion', 'DiscreteBundleSheafDiffusion', 'DiscreteGeneralSheafDiffusion', 'DiagSheaf', 'BundleSheaf', 'GeneralSheaf', 'DiagSheafODE',
                                                       'BundleSheafODE', 'GeneralSheafODE'], default=None)
     parser.add_argument('--entity', type=str, default=None)
     parser.add_argument('--evectors', type=int, default=0, help="Number of Laplacian PE eigenvectors to use.")

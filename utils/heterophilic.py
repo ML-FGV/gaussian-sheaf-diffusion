@@ -2,17 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+import torch.nn as nn
 import numpy as np
 import os.path as osp
 import torch_geometric.transforms as T
+import networkx as nx
 
 from typing import Optional, Callable, List, Union
 from torch_sparse import SparseTensor, coalesce
 from torch_geometric.data import InMemoryDataset, download_url, Data
 from torch_geometric.utils.undirected import to_undirected
-from torch_geometric.utils import remove_self_loops
+from torch_geometric.utils import remove_self_loops, from_networkx
 from utils.classic import Planetoid
 from definitions import ROOT_DIR
+from scipy.stats import invwishart
 
 
 class Actor(InMemoryDataset):
@@ -272,6 +275,100 @@ class WebKB(InMemoryDataset):
     def __repr__(self):
         return '{}()'.format(self.name)
 
+class GaussianGraph:
+    def __init__(self, num_nodes, p, dist_dim, num_samples, samples_dim):
+        self.num_nodes = num_nodes
+        self.p = p
+        self.dist_dim = dist_dim
+        self.num_samples = num_samples
+        self.samples_dim = samples_dim
+
+    def generate_sample(self, generator):
+        graph = self.generate_graph(generator)
+        self.generate_features(graph)
+        self.generate_labels(graph)
+        self.resize_params(graph)
+        dataset = from_networkx(graph)
+        rns = T.RandomNodeSplit(num_test=0.2, num_val=0.2)
+        dataset = rns(dataset)
+        dataset.dist_dim = self.dist_dim
+        dataset.num_samples = self.num_samples
+        dataset.samples_dim = self.samples_dim
+        #torch.save(self.collate([dataset]), self.processed_paths[0])
+        return dataset
+    
+    def generate_graph(self, generator):
+        if generator == 'erdos_renyi':
+            graph = nx.erdos_renyi_graph(self.num_nodes, self.p)
+        elif generator == 'barabasi_albert':
+            graph = nx.barabasi_albert_graph(self.num_nodes, 25)
+        elif generator == 'watts_strogatz':
+            graph = nx.watts_strogatz_graph(self.num_nodes, 45, self.p)
+        elif generator == 'random_geometric':
+            graph = nx.random_geometric_graph(self.num_nodes, 0.3)
+        elif generator == 'complete':
+            graph = nx.complete_graph(self.num_nodes)
+        #olhar loops
+
+        assert nx.is_connected(graph)
+
+        return graph
+
+    def generate_features(self, graph):
+        m = np.random.uniform(-1, 1, self.dist_dim)
+        S = np.random.uniform(-1, 1, (self.dist_dim, self.dist_dim))
+        S = S @ S.T
+
+        assert np.all(np.linalg.eigvals(S) > 0)
+
+        for n in range(graph.number_of_nodes()):
+            mean = torch.tensor(np.random.multivariate_normal(m, S), dtype=torch.float64)
+            cov = torch.tensor(invwishart.rvs(self.dist_dim, S), dtype=torch.float64) #+ 1e-6 * torch.eye(self.dist_dim, dtype=torch.float32)
+
+            if self.dist_dim != 1:
+                assert (torch.linalg.eigvals(cov).real >= 0).all()
+
+            graph.nodes[n]['x'] = (mean, cov)
+
+    def generate_labels(self, graph):
+        C = 1
+        for n in range(graph.number_of_nodes()):
+            mean_y, cov_y = graph.nodes[n]['x'][0].clone(), graph.nodes[n]['x'][1].clone()
+            neighbors_params = []
+            KL_divs = []
+
+            for neighbor in graph.neighbors(n):
+                mean, cov = graph.nodes[neighbor]['x']
+                neighbors_params.append((mean, cov, graph.degree(neighbor)))
+                KL_divs.append(self.KL_div(mean_y, cov_y, mean, cov).item())
+
+            #multiplicar v.a. por 1/sqrt(grau do no * grau do vizinho)
+            KL_divs = [1 / KL_divs[i] for i in range(len(KL_divs))]
+            m = max(KL_divs)
+            KL_divs = [C * KL_divs[i] / m for i in range(len(KL_divs))]
+            node_degree = graph.degree(n)
+
+            mean_y = mean_y + sum([KL_divs[i] * neighbors_params[i][0] for i in range(len(KL_divs))])
+            cov_y = cov_y + sum([KL_divs[i]**2 * neighbors_params[i][1] for i in range(len(KL_divs))])
+            #mean_y += sum([C/(node_degree * neighbors_params[i][2])**0.5 * neighbors_params[i][0] for i in range(len(KL_divs))])
+            #cov_y += sum([C**2/(node_degree * neighbors_params[i][2]) * neighbors_params[i][1] for i in range(len(KL_divs))])
+            if self.samples_dim == 1:
+                graph.nodes[n]['y'] = torch.distributions.normal.Normal(mean_y,cov_y).sample(torch.Size([self.num_samples])).flatten()
+            else:
+                graph.nodes[n]['y'] = torch.distributions.multivariate_normal.MultivariateNormal(mean_y,cov_y).sample(torch.Size([self.num_samples])).flatten()
+    
+    def KL_div(self, mean1, cov1, mean2, cov2):
+        if self.dist_dim == 1:
+            cov2_inv = 1/cov2
+            return 0.5 * (cov2_inv * cov1 + (mean2 - mean1)**2 - 1 + torch.log(cov2) - torch.log(cov1))
+        else:
+            cov2_inv = torch.inverse(cov2)
+            return 0.5 * (torch.trace(cov2_inv @ cov1) + (mean2 - mean1).t() @ cov2_inv @ (mean2 - mean1) - self.dist_dim + torch.logdet(cov2) - torch.logdet(cov1))
+    
+    def resize_params(self, graph):
+        for n in range(graph.number_of_nodes()):
+            mean, cov = graph.nodes[n]['x']
+            graph.nodes[n]['x'] = torch.cat([mean, cov.flatten()])
 
 def get_fixed_splits(data, dataset_name, seed):
     with np.load(f'splits/{dataset_name}_split_0.6_0.2_{seed}.npz') as splits_file:
@@ -295,7 +392,6 @@ def get_fixed_splits(data, dataset_name, seed):
 
     return data
 
-
 def get_dataset(name):
     data_root = osp.join(ROOT_DIR, 'datasets')
     if name in ['cornell', 'texas', 'wisconsin']:
@@ -306,6 +402,21 @@ def get_dataset(name):
         dataset = Actor(root=data_root, transform=T.NormalizeFeatures())
     elif name in ['cora', 'citeseer', 'pubmed']:
         dataset = Planetoid(root=data_root, name=name, transform=T.NormalizeFeatures())
+    elif name in ['erdos_renyi']:
+        dataset = GaussianGraph(num_nodes=200, p=0.5, dist_dim=2, num_samples=30, samples_dim=2).generate_sample('erdos_renyi')
+        print(dataset)
+    elif name in ['barabasi_albert']:
+        dataset = GaussianGraph(num_nodes=200, p=0.5, dist_dim=2, num_samples=30, samples_dim=2).generate_sample('barabasi_albert')
+        print(dataset)
+    elif name in ['watts_strogatz']:
+        dataset = GaussianGraph(num_nodes=200, p=0.5, dist_dim=2, num_samples=30, samples_dim=2).generate_sample('watts_strogatz')
+        print(dataset)
+    elif name in ['random_geometric']:
+        dataset = GaussianGraph(num_nodes=200, p=0.5, dist_dim=2, num_samples=30, samples_dim=2).generate_sample('random_geometric')
+        print(dataset)
+    elif name in ['complete']:
+        dataset = GaussianGraph(num_nodes=200, p=0.5, dist_dim=2, num_samples=30, samples_dim=2).generate_sample('complete')
+        print(dataset)
     else:
         raise ValueError(f'dataset {name} not supported in dataloader')
 

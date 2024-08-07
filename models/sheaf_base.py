@@ -22,6 +22,13 @@ class SheafDiffusion(nn.Module):
             self.final_d += 1
         if self.add_lp:
             self.final_d += 1
+        
+        self.rest_maps_type = args['rest_maps_type']
+        self.rest_maps_mlp_layers = args['rest_maps_mlp_layers']
+        self.rest_maps_mlp_hc = args['rest_maps_mlp_hc']
+        self.final_mlp_layers = args['final_mlp_layers']
+        self.final_mlp_hc = args['final_mlp_hc']
+        self.lr_decay_patience = args['lr_decay_patience']
 
         self.hidden_dim = args['hidden_channels'] * self.final_d
         self.device = args['device']
@@ -38,7 +45,6 @@ class SheafDiffusion(nn.Module):
         self.use_act = args['use_act']
         self.input_dim = args['input_dim']
         self.hidden_channels = args['hidden_channels']
-        self.output_dim = args['output_dim']
         self.layers = args['layers']
         self.sheaf_act = args['sheaf_act']
         self.second_linear = args['second_linear']
@@ -47,6 +53,10 @@ class SheafDiffusion(nn.Module):
         self.t = args['max_t']
         self.time_range = torch.tensor([0.0, self.t], device=self.device)
         self.laplacian_builder = None
+
+        self.dist_dim = args['dist_dim']
+        self.num_samples = args['num_samples']
+        self.samples_dim = args['samples_dim']
 
     def update_edge_index(self, edge_index):
         assert edge_index.max() <= self.graph_size
@@ -60,6 +70,33 @@ class SheafDiffusion(nn.Module):
                 sheaf_learners.append(param)
             else:
                 others.append(param)
-        assert len(sheaf_learners) > 0
+        #assert len(sheaf_learners) > 0
         assert len(sheaf_learners) + len(others) == len(list(self.parameters()))
         return sheaf_learners, others
+    
+    def get_samples(self, x):
+        x_mu = x[:, :self.dist_dim]
+        x_sig = x[:, self.dist_dim:]
+        x_sig = x_sig.view(-1, self.dist_dim, self.dist_dim)
+        x_sig = torch.linalg.cholesky(x_sig)
+
+        rn = torch.randn((self.graph_size, self.dist_dim, self.num_samples), dtype=torch.float64, device=self.device)
+        samples = x_mu[..., None] + x_sig @ rn
+
+        return samples
+    
+    def set_mlps(self):
+        mlp_num_layers = self.final_mlp_layers
+        mlp_hidden_channels = self.final_mlp_hc
+
+        mlp_layers = [nn.Linear(self.dist_dim, mlp_hidden_channels, dtype=torch.float64)]
+        for i in range(mlp_num_layers-1):
+            mlp_layers.append(nn.ReLU())
+            mlp_layers.append(nn.Linear(mlp_hidden_channels, mlp_hidden_channels, dtype=torch.float64))
+            
+        mlp_layers.append(nn.ReLU())
+        mlp_layers.append(nn.Linear(mlp_hidden_channels, self.samples_dim, dtype=torch.float64))
+
+        mlp = nn.Sequential(*mlp_layers)
+
+        return mlp
